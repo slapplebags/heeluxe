@@ -1,7 +1,16 @@
 /*
   StampPLC_Treadmill_Controller.ino
 
-  Standalone controller for ONE treadmill / Time Machine.
+  Treadmill controller with optional Modbus RTU networking (firmware 7).
+  Flash the SAME sketch on every unit. In each unit's web UI, open RS485
+  settings and select Standalone, Primary (ID 1), or Secondary (unique ID 2..8).
+  New units default to Standalone. Saved role/address survive power cycles.
+  Applying bus settings requires a stopped/settled unit and restarts it.
+  Configure one preferred primary (ID 1); every secondary has a unique ID 2..8.
+  Connect PWR485 A-A, B-B, GND-GND; leave VIN disconnected between
+  independently powered units. Enable the onboard RS485 120 ohm termination
+  at the two bus ends only (the CAN termination switch is separate).
+  Primary polls secondarys; each treadmill remains locally controlled on bus loss.
 
   Hardware plan
   -------------
@@ -40,8 +49,9 @@
   Loss during a save may lose the latest pulse; coast-down during an outage
   cannot be counted. Inspect/reset or reconcile the count before re-arming.
   Test at 10 Hz with >=20 ms active AND inactive widths, under web load.
-  Network task never accesses hardware; requests go through a bounded queue.
-  No RS485, OTA, email, cloud service or automatic motor-start in this version.
+  Network tasks never access treadmill I/O; requests go through bounded queues.
+  Modbus reads status and queues guarded commands; no raw relay writes or ARM.
+  No OTA, email, cloud service or automatic motor-start in this version.
   Web controls use HTTP basic authentication: trusted LAN only, no port forward.
   SETUP / COMMISSIONING
   ---------------------
@@ -77,9 +87,9 @@
   9. Tap A/B/C while stopped to select 10,000/50,000/100,000 target steps.
      Edit PRESETS below to change these three values. Selection preserves count.
      Hold B >=1 s and release to arm/resume or pause. Hold C >=3 s and
-     release to reset count while stopped and settled. Use mushroom for STOP.
+     release to reset count while stopped. Use mushroom for STOP.
      Web acknowledge only silences; reset clears count/recovery fault once
-     inputs are quiet. Reboot required after repairing a runtime FRAM fault.
+     the E-stop is released and I/O/storage checks pass. Reset retries FRAM.
   10. Green = permit, red = not permitted; buzzer sounds briefly on stop/fault.
       No safety certification, redundant stop, mains isolation or motor feedback.
 */
@@ -99,10 +109,6 @@ TwoWire framBus(1);
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 
-// ---------------------------------------------------------------------------
-// Installation configuration -- verify these during bench commissioning.
-// ---------------------------------------------------------------------------
-
 // Optional factory defaults. Normally leave these blank and configure Wi-Fi
 // from the fallback access point's web page. Saved settings override defaults.
 constexpr char WIFI_SSID[]     = "";
@@ -111,6 +117,14 @@ constexpr char AP_PASSWORD[]   = "fluxcapacitor"; // minimum 8 characters
 constexpr char WEB_PASSWORD[]  = "change-this-password";
 constexpr bool WIRING_VERIFIED = true; // this unit has completed bench wiring checks
 constexpr uint32_t MAX_TARGET = 1000000000;
+
+// Loaded from NVS at boot, immutable until restart. Configure via /bus.
+// Standalone defaults avoid address collisions when several new units boot.
+bool RS485_ENABLED = false;
+bool PREFERRED_PRIMARY = false;
+uint8_t NODE_ID = 0;
+bool busConfigRestartPending = false; // hardware-loop owned
+uint32_t busConfigRestartAt = 0;
 
 constexpr uint8_t SENSOR_INPUT_CHANNEL = 0;
 constexpr uint8_t STOP_AUX_INPUT_CHANNEL = 1;
@@ -208,9 +222,10 @@ void setRelay(uint8_t channel, bool active, bool activeLevel = true);
 void startExternalBeep(uint32_t durationMs = EXTERNAL_BEEP_MS);
 void storageFault();
 void setTreadmillStopped(bool stopped);
-enum class CommandKind : uint8_t { ARM, PAUSE, STOP, ACK, RESET, TARGET };
-struct Command { CommandKind kind; uint32_t value; };
+enum class CommandKind : uint8_t { ARM, PAUSE, STOP, ACK, RESET, TARGET, BUS_CONFIG };
+struct Command { CommandKind kind; uint32_t value; uint32_t deadline = 0; };
 QueueHandle_t commandQueue;
+QueueHandle_t busConfigReplyQueue;
 SemaphoreHandle_t snapshotMutex;
 String sharedStatus;
 String networkAddress;
@@ -457,7 +472,7 @@ void serviceStopPulse() {
 }
 
 void armTest() {
-  if (completionLatched || !inputsHealthy || !WIRING_VERIFIED || !framAvailable || stopAuxStable || stopAuxCandidate ||
+  if (busConfigRestartPending || completionLatched || !inputsHealthy || !WIRING_VERIFIED || !framAvailable || stopAuxStable || stopAuxCandidate ||
       stepTarget == 0 ||
       stepCount >= stepTarget || millis() - lastObservedEdge < 3000 ||
       runState == RunState::FAULT) {
@@ -659,33 +674,454 @@ String jsonStatus() {
   json += "\"fram\":" + String(framAvailable ? "true" : "false") + ",";
   json += "\"reset_message\":\"" + resetMessage + "\",";
   json += "\"max_scan_gap_ms\":" + String(maxScanGap) + ",";
-  json += "\"wiring_verified\":" + String(WIRING_VERIFIED ? "true" : "false") + "}";
+  json += "\"wiring_verified\":" + String(WIRING_VERIFIED ? "true" : "false");
+  json += ",\"node\":" + String(NODE_ID) + ",\"online\":true,\"age_ms\":0,\"command_status\":0";
+  json += ",\"inputs_healthy\":" + String(inputsHealthy ? "true" : "false");
+  json += ",\"completed\":" + String(completionLatched ? "true" : "false");
+  uint8_t relays=0; for(int i=0;i<4;++i) relays |= uint8_t(relayCommanded[i])<<i;
+  json += ",\"relays\":"+String(relays)+",\"presets\":[";
+  for(int i=0;i<3;++i) { if(i)json+=','; json+=u64(PRESETS[i]); }
+  json += "],\"no_pulse_seconds\":"+String(NO_PULSE_FAULT_MS/1000)+
+          ",\"arm_timeout_seconds\":"+String(ARM_WAIT_TIMEOUT_MS/1000)+"}";
   return json;
 }
+
+// Modbus RTU with election announcements. Every address 1..8 can lead.
+// All UART operations live on their own task; only loop() touches PLC I/O/FRAM.
+// Holding registers: 0..47 snapshot, 256..258 atomic command mailbox (FC16).
+constexpr uint8_t BUS_LAST_NODE = 8;
+constexpr uint16_t BUS_REG_COUNT = 48;
+constexpr uint32_t BUS_BAUD = 19200;
+constexpr uint32_t BUS_OFFLINE_MS = 6000;
+constexpr uint32_t BUS_TIMEOUT_MS = 200;
+HardwareSerial rs485(1);
+struct BusPeer {
+  bool seen = false;
+  uint32_t lastSeen = 0;
+  uint16_t regs[BUS_REG_COUNT] = {};
+  uint8_t commandStatus = 0; // 0 none, 1 queued, 2 accepted, 3 rejected, 4 unknown/timeout
+};
+String peerJson(uint8_t id, const BusPeer &p);
+bool decodeBusCommand(const uint8_t *p, size_t n, Command &c);
+struct BusCommand { uint8_t node; Command command; uint32_t queuedAt; uint32_t epoch; };
+BusPeer peers[BUS_LAST_NODE + 1];
+uint16_t localRegs[BUS_REG_COUNT] = {};
+QueueHandle_t busCommandQueue;
+bool sharedPrimary=false, sharedCandidate=false;
+uint8_t sharedLeader=0;
+uint32_t sharedBusEpoch=0;
+bool displayPrimary=false, displayCandidate=false;
+bool sharedBusReady = false, sharedBusSeen = false;
+uint32_t sharedBusLast = 0;
+bool displayBusReady = false, displayBusOnline = false;
+uint32_t busLastValid = 0;
+bool busSeen = false;
+
+uint16_t mbCrc(const uint8_t *data, size_t size) {
+  uint16_t crc = 0xffff;
+  for (size_t i = 0; i < size; ++i) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; ++j) crc = (crc >> 1) ^ ((crc & 1) ? 0xa001 : 0);
+  }
+  return crc;
+}
+uint16_t mbWord(const uint8_t *p) { return (uint16_t(p[0]) << 8) | p[1]; }
+void mbPut(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
+bool mbValid(const uint8_t *p, size_t n) {
+  return n >= 4 && mbCrc(p, n - 2) == (uint16_t(p[n-1]) << 8 | p[n-2]);
+}
+void mbSend(uint8_t *p, size_t n) {
+  const uint16_t crc = mbCrc(p, n);
+  p[n++] = crc; p[n++] = crc >> 8;
+  rs485.write(p, n);
+  rs485.flush(true); // TX only; hardware RTS releases DE after the last stop bit
+}
+
+// Called only in loop(), then copied under the short snapshot lock.
+void buildBusSnapshot(uint16_t *r) {
+  memset(r, 0, BUS_REG_COUNT * sizeof(uint16_t));
+  r[0] = 0x4658; r[1] = 2;
+  uint64_t mac = ESP.getEfuseMac();
+  for (int i=0; i<3; ++i) r[2+i] = mac >> (16*(2-i));
+  r[5] = uint16_t(runState); r[6] = uint16_t(stopReason);
+  for (int i=0; i<4; ++i) r[7+i] = stepCount >> (16*(3-i));
+  r[11] = stepTarget >> 16; r[12] = stepTarget;
+  r[13] = sensorStable | (stopAuxStable << 1) | (framAvailable << 2) |
+          (inputsHealthy << 3) | (WIRING_VERIFIED << 4) | (completionLatched << 5);
+  for (int i=0; i<4; ++i) r[14] |= uint16_t(relayCommanded[i]) << i;
+  r[15] = maxScanGap >> 16; r[16] = maxScanGap;
+  for (int i=0; i<3; ++i) { r[17+i*2] = PRESETS[i] >> 16; r[18+i*2] = PRESETS[i]; }
+  r[23] = presetIndex;
+  // Last operator result, up to 40 printable ASCII characters.
+  for (size_t i=0; i<40 && i<resetMessage.length(); ++i)
+    r[24+i/2] |= uint16_t(uint8_t(resetMessage[i])) << ((i%2) ? 0 : 8);
+  r[44] = NO_PULSE_FAULT_MS / 1000;
+  r[45] = ARM_WAIT_TIMEOUT_MS / 1000;
+  r[46] = resetMessageError;
+}
+
+// Pure validation before a remote command reaches the hardware-owning loop.
+bool decodeBusCommand(const uint8_t *p, size_t n, Command &c) {
+  if (n != 15 || p[1] != 16 || mbWord(p+2) != 256 || mbWord(p+4) != 3 || p[6] != 6)
+    return false;
+  const uint16_t op = mbWord(p+7);
+  const uint32_t value = (uint32_t(mbWord(p+9)) << 16) | mbWord(p+11);
+  if (op < uint16_t(CommandKind::PAUSE) || op > uint16_t(CommandKind::TARGET)) return false;
+  if (op == uint16_t(CommandKind::TARGET) && (value == 0 || value > MAX_TARGET)) return false;
+  if (op != uint16_t(CommandKind::TARGET) && value != 0) return false;
+  c = {CommandKind(op), value};
+  return true;
+}
+
+void busSecondaryFrame(const uint8_t *p, size_t n) {
+  if (!mbValid(p,n) || p[0] != NODE_ID) return; // No broadcast writes.
+  uint8_t out[2*BUS_REG_COUNT+5] = {NODE_ID, p[1]};
+  uint8_t error = 1;
+  if (p[1] == 3 && n == 8) {
+    const uint16_t start = mbWord(p+2), count = mbWord(p+4);
+    error = 2;
+    if (count && start < BUS_REG_COUNT && count <= BUS_REG_COUNT-start) {
+      uint16_t r[BUS_REG_COUNT];
+      xSemaphoreTake(snapshotMutex, portMAX_DELAY);
+      memcpy(r, localRegs, sizeof(r));
+      xSemaphoreGive(snapshotMutex);
+      out[2] = count*2;
+      for (uint16_t i=0; i<count; ++i) mbPut(out+3+2*i, r[start+i]);
+      mbSend(out, 3+count*2);
+      busSeen = true; busLastValid = millis();
+      return;
+    }
+  } else if (p[1] == 16) {
+    Command c;
+    error = 3;
+    if (decodeBusCommand(p,n,c)) {
+      c.deadline = millis() + 1000;
+      if (xQueueSend(commandQueue, &c, 0) != pdTRUE) error = 6;
+      else {
+        memcpy(out,p,6); mbSend(out,6);
+        busSeen = true; busLastValid = millis();
+        return; // ACK means queued; local guards decide whether it executes.
+      }
+    }
+  }
+  out[1] |= 0x80; out[2] = error; mbSend(out,3);
+}
+
+// BEGIN ELECTION ENGINE -- pure state machine, exercised by host tests.
+class BusElection {
+ public:
+  enum Action : uint8_t { NONE=0, CLAIM=1, HEARTBEAT=2 };
+  static constexpr uint32_t LEASE_MS=6000, CLAIM_LEASE_MS=1800, SETTLE_MS=700;
+  uint8_t id=0;
+  bool primary=false, candidate=false;
+  struct Seen { bool valid=false, primary=false; uint32_t at=0; } seen[9];
+  uint32_t lastTrafficAt=0, scheduledAt=0, claimAt=0, announceAt=0, interval=700;
+  bool scheduled=false;
+  void begin(uint8_t address,uint32_t now) {
+    id=address; primary=candidate=scheduled=false; lastTrafficAt=now;
+    for(auto &s:seen)s=Seen{};
+  }
+  void observe(uint8_t address,bool isPrimary,uint32_t now) {
+    if(address<1 || address>8 || address==id)return;
+    seen[address]={true,isPrimary,now};
+    if(isPrimary)lastTrafficAt=now;
+  }
+  // Valid polling traffic also holds off takeover, including during upgrades.
+  void observePoll(uint32_t now) { lastTrafficAt=now; }
+  uint8_t leader(uint32_t now) const {
+    uint8_t best=primary?id:0;
+    for(uint8_t n=1;n<=8;++n)if(seen[n].valid && seen[n].primary &&
+        now-seen[n].at<LEASE_MS && (!best || n<best))best=n;
+    return best;
+  }
+  Action tick(uint32_t now,uint32_t entropy) {
+    bool higherPrimary=false;
+    for(uint8_t n=1;n<=8;++n) {
+      auto &s=seen[n];
+      if(s.valid && now-s.at >= (s.primary?LEASE_MS:CLAIM_LEASE_MS))s.valid=false;
+      if(!s.valid)continue;
+      if(n<id) {
+        primary=candidate=scheduled=false;
+        return NONE;
+      }
+      if(s.primary)higherPrimary=true;
+    }
+    if(primary) {
+      if(now-announceAt>=interval) {
+        announceAt=now; interval=650+entropy%250; return HEARTBEAT;
+      }
+      return NONE;
+    }
+    if(candidate) {
+      if(now-claimAt>=SETTLE_MS) {
+        candidate=false;primary=true;announceAt=now;interval=650+entropy%250;
+        return HEARTBEAT;
+      }
+      if(now-announceAt>=250) { announceAt=now;return CLAIM; }
+      return NONE;
+    }
+    if(!higherPrimary && now-lastTrafficAt<LEASE_MS) { scheduled=false;return NONE; }
+    if(!scheduled) { scheduled=true;scheduledAt=now+100*id+entropy%80; }
+    if(int32_t(now-scheduledAt)>=0) {
+      scheduled=false;candidate=true;claimAt=announceAt=now;return CLAIM;
+    }
+    return NONE;
+  }
+};
+// END ELECTION ENGINE
+
+void busTask(void *) {
+  if (!RS485_ENABLED) { vTaskDelete(nullptr); return; }
+  rs485.setRxBufferSize(256);
+  rs485.begin(BUS_BAUD, SERIAL_8N1, 39, 0);
+  bool ready = bool(rs485) && rs485.setPins(39, 0, -1, 46) &&
+               rs485.setMode(UART_MODE_RS485_HALF_DUPLEX);
+  rs485.setRxFIFOFull(1);
+  xSemaphoreTake(snapshotMutex, portMAX_DELAY); sharedBusReady=ready; xSemaphoreGive(snapshotMutex);
+  if (!ready) { Serial.println("RS485 UART init failed"); vTaskDelete(nullptr); return; }
+  BusElection election; election.begin(NODE_ID,millis());
+  uint8_t rx[128],request[16];size_t used=0;
+  bool overflow=false,pending=false,writing=false,wasPrimary=false;
+  uint8_t destination=0,scan=1,announcement=0;
+  uint32_t lastByte=millis(),sentAt=0,nextPoll=millis();
+  for (;;) {
+    unsigned budget=256;
+    while(budget-- && rs485.available()) {
+      int b=rs485.read();if(used<sizeof(rx))rx[used++]=uint8_t(b);else overflow=true;
+      lastByte=millis();
+    }
+    const uint32_t now=millis();
+    if((used || overflow) && now-lastByte>=4) {
+      if(!overflow && mbValid(rx,used)) {
+        if(used==9 && rx[0]==0 && rx[1]==65 && rx[2]==0x46 && rx[3]==0x58 &&
+           rx[4]==2 && rx[5]>=1 && rx[5]<=BUS_LAST_NODE && (rx[6]==1 || rx[6]==2)) {
+          election.observe(rx[5],rx[6]==BusElection::HEARTBEAT,now);
+          if(rx[5]!=NODE_ID && rx[6]==BusElection::HEARTBEAT) { busSeen=true;busLastValid=now; }
+        } else {
+          if(used==8 && rx[0]>=1 && rx[0]<=BUS_LAST_NODE && rx[1]==3 &&
+             mbWord(rx+2)==0 && mbWord(rx+4)==BUS_REG_COUNT)election.observePoll(now);
+          if(!election.primary)busSecondaryFrame(rx,used);
+          else if(pending && rx[0]==destination) {
+            bool accepted=false;uint16_t r[BUS_REG_COUNT];
+            if(!writing && used==5+2*BUS_REG_COUNT && rx[1]==3 && rx[2]==2*BUS_REG_COUNT) {
+              for(int i=0;i<BUS_REG_COUNT;++i)r[i]=mbWord(rx+3+2*i);
+              accepted=r[0]==0x4658 && r[1]==2 && r[5]<=uint16_t(RunState::FAULT) && r[6]<=uint16_t(StopReason::INPUT_IO);
+              if(accepted) {
+                xSemaphoreTake(snapshotMutex,portMAX_DELAY);
+                peers[destination].seen=true;peers[destination].lastSeen=now;
+                memcpy(peers[destination].regs,r,sizeof(r));xSemaphoreGive(snapshotMutex);
+              }
+            } else if(writing && used==8 && rx[1]==16 && mbWord(rx+2)==256 && mbWord(rx+4)==3) {
+              accepted=true;
+              xSemaphoreTake(snapshotMutex,portMAX_DELAY);peers[destination].commandStatus=2;xSemaphoreGive(snapshotMutex);
+              scan=destination;nextPoll=now;
+            } else if(used==5 && rx[1]==uint8_t((writing?16:3)|0x80)) {
+              pending=false;
+              if(writing) { xSemaphoreTake(snapshotMutex,portMAX_DELAY);peers[destination].commandStatus=3;xSemaphoreGive(snapshotMutex); }
+            }
+            if(accepted) { pending=false;busSeen=true;busLastValid=now; }
+          }
+        }
+      }
+      used=0;overflow=false;
+    }
+    auto action=election.tick(now,esp_random());
+    if(election.primary!=wasPrimary) {
+      // Old UI requests must never replay after a future promotion.
+      xSemaphoreTake(snapshotMutex,portMAX_DELAY);
+      if(pending && writing)peers[destination].commandStatus=4;
+      for(auto &p:peers)if(p.commandStatus==1)p.commandStatus=3;
+      ++sharedBusEpoch;
+      xSemaphoreGive(snapshotMutex);
+      BusCommand discarded;while(xQueueReceive(busCommandQueue,&discarded,0)==pdTRUE) {}
+      pending=false;scan=1;nextPoll=now;wasPrimary=election.primary;
+    }
+    if(!election.primary && !election.candidate)announcement=0;
+    if(action!=BusElection::NONE)announcement=uint8_t(action);
+    if(pending && now-sentAt>=BUS_TIMEOUT_MS) {
+      if(writing) { xSemaphoreTake(snapshotMutex,portMAX_DELAY);peers[destination].commandStatus=4;xSemaphoreGive(snapshotMutex); }
+      pending=false;
+    }
+    if(!pending && !used && !overflow && now-lastByte>=4) {
+      if(announcement) {
+        uint8_t hello[9]={0,65,0x46,0x58,2,NODE_ID,announcement,0,0};
+        mbSend(hello,7);announcement=0;lastByte=millis();
+      } else if(election.primary) {
+        BusCommand bc;bool send=false;size_t len=0;
+        if(xQueueReceive(busCommandQueue,&bc,0)==pdTRUE) {
+          destination=bc.node;writing=true;
+          xSemaphoreTake(snapshotMutex,portMAX_DELAY);
+          const bool online=peers[destination].seen && now-peers[destination].lastSeen<BUS_OFFLINE_MS;
+          const bool current=bc.epoch==sharedBusEpoch;
+          if(!online || !current || now-bc.queuedAt>1500)peers[destination].commandStatus=3;
+          xSemaphoreGive(snapshotMutex);
+          if(online && current && now-bc.queuedAt<=1500) {
+            request[0]=destination;request[1]=16;mbPut(request+2,256);mbPut(request+4,3);request[6]=6;
+            mbPut(request+7,uint16_t(bc.command.kind));mbPut(request+9,bc.command.value>>16);mbPut(request+11,bc.command.value);
+            len=13;send=true;
+          }
+        } else if(int32_t(now-nextPoll)>=0) {
+          if(scan==NODE_ID && ++scan>BUS_LAST_NODE)scan=1;
+          destination=scan;if(++scan>BUS_LAST_NODE)scan=1;
+          writing=false;request[0]=destination;request[1]=3;mbPut(request+2,0);mbPut(request+4,BUS_REG_COUNT);
+          len=6;send=true;nextPoll=now+250;
+        }
+        if(send) { mbSend(request,len);pending=true;sentAt=millis();lastByte=sentAt; }
+      }
+    }
+    xSemaphoreTake(snapshotMutex,portMAX_DELAY);
+    sharedBusSeen=busSeen;sharedBusLast=busLastValid;
+    sharedPrimary=election.primary;sharedCandidate=election.candidate;sharedLeader=election.leader(now);
+    xSemaphoreGive(snapshotMutex);
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+String jsonQuoted(const String &s) {
+  String out = "\"";
+  for (size_t i=0; i<s.length(); ++i) {
+    const uint8_t c=s[i];
+    if (c=='"' || c=='\\') { out+='\\'; out+=char(c); }
+    else if (c>=32 && c<127) out+=char(c);
+    else out+='?';
+  }
+  return out+'"';
+}
+String peerJson(uint8_t id, const BusPeer &p) {
+  const uint16_t *r=p.regs;
+  uint64_t count=0,mac=0;
+  for(int i=0;i<4;++i) count=(count<<16)|r[7+i];
+  for(int i=0;i<3;++i) mac=(mac<<16)|r[2+i];
+  char name[18]; snprintf(name,sizeof(name),"flux-%012llX",(unsigned long long)mac);
+  String message;
+  for(int i=0;i<40;++i) { char c=r[24+i/2]>>((i%2)?0:8); if(!c)break; message+=c; }
+  const uint32_t age=millis()-p.lastSeen;
+  String j="{\"node\":"+String(id)+",\"online\":"+String(age<BUS_OFFLINE_MS?"true":"false")+
+    ",\"age_ms\":"+String(age)+",\"device\":"+jsonQuoted(name)+
+    ",\"state\":"+jsonQuoted(stateName(RunState(r[5])))+",\"reason\":"+jsonQuoted(reasonName(StopReason(r[6])))+
+    ",\"count\":"+u64(count)+",\"target\":"+String((uint32_t(r[11])<<16)|r[12]);
+  const char *flags[]={"sensor","stop_button","fram","inputs_healthy","wiring_verified","completed"};
+  for(int i=0;i<6;++i) j+=",\""+String(flags[i])+"\":"+String((r[13]&(1<<i))?"true":"false");
+  j+=",\"relays\":"+String(r[14])+",\"max_scan_gap_ms\":"+String((uint32_t(r[15])<<16)|r[16])+",\"presets\":[";
+  for(int i=0;i<3;++i) { if(i)j+=','; j+=String((uint32_t(r[17+2*i])<<16)|r[18+2*i]); }
+  j+="],\"reset_message\":"+jsonQuoted(message)+",\"command_status\":"+String(p.commandStatus)+
+    ",\"no_pulse_seconds\":"+String(r[44])+",\"arm_timeout_seconds\":"+String(r[45])+"}";
+  return j;
+}
+void sendNodes() {
+  if (!authenticated()) return;
+  BusPeer copy[BUS_LAST_NODE+1]; String local; bool ready,primary,candidate; uint8_t leader;
+  xSemaphoreTake(snapshotMutex,portMAX_DELAY);
+  memcpy(copy,peers,sizeof(copy)); local=sharedStatus; ready=sharedBusReady;
+  primary=sharedPrimary;candidate=sharedCandidate;leader=sharedLeader;
+  xSemaphoreGive(snapshotMutex);
+  String j="{\"local_node\":"+String(NODE_ID)+",\"primary\":"+String(primary?"true":"false")+
+    ",\"leader\":"+String(leader)+",\"candidate\":"+String(candidate?"true":"false")+
+    ",\"bus_enabled\":"+String(RS485_ENABLED?"true":"false")+
+    ",\"bus_ready\":"+String(ready?"true":"false")+",\"nodes\":["+local;
+  if(primary) for(uint8_t i=1;i<=BUS_LAST_NODE;++i) if(i!=NODE_ID && copy[i].seen) j+=","+peerJson(i,copy[i]);
+  j+="]}";
+  server.sendHeader("Cache-Control","no-store"); server.send(200,"application/json",j);
+}
+
+// A single packed NVS value makes role/address updates atomic.
+bool validBusConfig(uint32_t packed) {
+  const uint32_t role=packed>>8, id=packed&255;
+  return packed==0 || (role==1 && id==1) || (role==2 && id>=2 && id<=8);
+}
+void loadBusSettings() {
+  Preferences p; uint32_t packed=0;
+  if(p.begin("flux-bus",true)) { packed=p.getUInt("config",0); p.end(); }
+  if(!validBusConfig(packed)) packed=0;
+  RS485_ENABLED=packed!=0; PREFERRED_PRIMARY=(packed>>8)==1; NODE_ID=packed&255;
+}
+// Only the hardware-owning loop calls this. A successful save holds permit
+// OFF and blocks local arm until reboot, closing the save/re-arm race.
+uint8_t applyBusSettings(uint32_t packed) {
+  if(!validBusConfig(packed)) return 2;
+  if(busConfigRestartPending) return 4;
+  if(runState==RunState::RUNNING || runState==RunState::ARMED || millis()-lastObservedEdge<3000) return 1;
+  setTreadmillStopped(true);
+  Preferences p;
+  if(!p.begin("flux-bus",false)) return 3;
+  bool ok=p.putUInt("config",packed)==sizeof(uint32_t);
+  p.end();
+  if(!ok) return 3;
+  busConfigRestartPending=true;
+  busConfigRestartAt=millis()+1500;
+  reportReset("Bus saved; restarting",false);
+  return 0;
+}
+
+const char BUS_PAGE[] PROGMEM = R"HTML(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RS-485 settings</title>
+<style>body{font-family:system-ui;background:#15181d;color:#eee;max-width:560px;margin:2rem auto;padding:0 1rem}label{display:block;margin-top:1rem}input,select,button{font:inherit;padding:.7rem;margin:.4rem 0}a{color:#7fd3ff}</style>
+</head><body><h1>RS-485 settings</h1><p id="device">Loading…</p><p>These settings apply to this physical unit. The same firmware runs on every unit.</p>
+<form id="form"><label>Role <select id="role" onchange="roleChanged()"><option value="0">Standalone — RS-485 off</option><option value="1">Preferred primary — address 1</option><option value="2">Secondary — automatic failover</option></select></label>
+<label>Node address <input id="address" type="number" min="2" max="8" step="1" value="2" required></label>
+<p>Use one preferred primary at address 1. Give each secondary a different address from 2 through 8. The lowest available address is elected primary; secondary Wi-Fi is off.</p>
+<p>Stop this treadmill and wait for sensor activity to settle before saving. Saving restarts this unit; it does not reset the count or arm the treadmill. A secondary will disconnect this Wi-Fi session. Disconnect its RS-485 cable to let it become primary for later configuration.</p>
+<button id="save" disabled>Save and restart</button></form><p id="result" role="status"></p><p><a href="/">Back to dashboard</a></p>
+<script>
+const el=id=>document.getElementById(id);
+function roleChanged(){const role=Number(el('role').value);el('address').disabled=role!==2;if(role!==2)el('address').value=role===1?1:0;else if(Number(el('address').value)<2)el('address').value=2;}
+async function load(){try{const r=await fetch('/api/bus');if(!r.ok)throw Error(r.status);const s=await r.json();el('device').textContent=s.device;el('role').value=s.role;el('address').value=s.node;roleChanged();el('save').disabled=false;}catch(e){el('result').textContent='Could not load settings. Reload this page.'}}
+el('form').onsubmit=async e=>{e.preventDefault();if(!confirm('Save RS-485 settings and restart this stopped unit?'))return;el('save').disabled=true;
+try{const r=await fetch('/api/bus?role='+el('role').value+'&node='+el('address').value,{method:'POST',headers:{'X-Flux-Control':'1'}});el('result').textContent=await r.text();if(r.ok)setTimeout(()=>location.href='/',7000);else el('save').disabled=false;}catch(e){el('result').textContent='Connection lost; reload and check saved settings before retrying.';el('save').disabled=false;}};
+load();
+</script></body></html>
+)HTML";
 
 const char PAGE[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Flux Capacitor</title><style>
-body{font-family:system-ui;background:#15181d;color:#eee;max-width:720px;margin:2rem auto;padding:0 1rem}
-.card{background:#222831;border-radius:12px;padding:1.2rem;margin-bottom:1rem}.count{font-size:3rem;font-weight:700}
+body{font-family:system-ui;background:#15181d;color:#eee;max-width:800px;margin:2rem auto;padding:0 1rem}
+.card{background:#222831;border-radius:12px;padding:1.2rem;margin:1rem 0}.count{font-size:2.7rem;font-weight:700}
 button,input{font:inherit;padding:.7rem;margin:.25rem;border-radius:7px;border:0}button{cursor:pointer}
-.go{background:#35b66a}.stop{background:#e34b4b}.muted{color:#adb5bd}.row{display:flex;flex-wrap:wrap;gap:.4rem}
-</style></head><body><h1>Flux Capacitor</h1><div class="card"><div id="state">Loading...</div>
-<div class="count"><span id="count">-</span> / <span id="target">-</span></div><div class="muted" id="reason"></div></div>
-<div class="card row"><span>A/B/C select targets. Hold B for 1 second and release to arm/pause. Hold C for 3 seconds to reset while stopped.</span><button onclick="cmd('/api/pause')">Pause and stop</button>
-<button class="stop" onclick="cmd('/api/stop')">Stop</button><button onclick="cmd('/api/ack')">Acknowledge</button>
-<button onclick="if(confirm('Reset the step count?'))cmd('/api/reset')">Reset count</button></div>
-<div class="card"><form onsubmit="setTarget(event)"><label>Target steps </label><input id="newtarget" type="number" min="1" max="1000000000" step="1" required>
-<button type="submit">Set target</button></form></div>
-<div class="card"><a href="/wifi" style="color:#7fd3ff">Wi-Fi settings</a></div>
-<div class="muted" id="details"></div>
+button:disabled{opacity:.4;cursor:default}.stop{background:#e34b4b}.muted{color:#adb5bd}
+.row{display:flex;flex-wrap:wrap;gap:.4rem}[aria-selected=true]{outline:3px solid #7fd3ff}a{color:#7fd3ff}
+dt{color:#adb5bd}dd{margin:0 0 .7rem}#notice{min-height:1.5rem;color:#ffd47f}
+</style></head><body><h1>Flux Capacitor</h1><p id="bus" class="muted">Connecting…</p>
+<div id="tabs" class="row" role="tablist" aria-label="Treadmill nodes"></div>
+<main id="panel" role="tabpanel"><div class="card"><div id="identity"></div><h2 id="state">Loading…</h2>
+<div class="count"><span id="count">—</span> / <span id="target">—</span></div><p id="reason"></p><p id="freshness" class="muted"></p></div>
+<div class="card"><p>Arm/resume at this treadmill: hold B for 1 second and release. Reset does not arm it.</p>
+<div class="row"><button data-control onclick="cmd('pause')">Pause and stop</button><button data-control class="stop" onclick="cmd('stop')">Stop</button>
+<button data-control onclick="cmd('ack')">Silence buzzer</button><button data-control onclick="resetNode()">Reset count</button></div>
+<p id="notice" role="status"></p></div>
+<div class="card"><h2>Node settings</h2><form onsubmit="setTarget(event)"><label for="newtarget">Target steps</label>
+<input id="newtarget" type="number" min="1" max="1000000000" step="1" required><button id="saveTarget" data-control>Save target</button></form>
+<p id="settings" class="muted"></p><p>Button presets and timeouts are configured in the sketch.</p></div>
+<div class="card"><h2>Inputs and outputs</h2><dl id="details"></dl><p class="muted">Relay indicators show commanded coils, not contact feedback. Network Stop is not an emergency-stop circuit.</p></div></main>
+<p><a href="/bus">RS-485 role and address</a> · <a href="/wifi">Wi-Fi settings</a> — for this web-hosting unit</p>
 <script>
-const el=id=>document.getElementById(id);
-async function cmd(u){let r=await fetch(u,{method:'POST',headers:{'X-Flux-Control':'1'}});if(!r.ok)alert(await r.text());await refresh()}
-async function setTarget(e){e.preventDefault();await cmd('/api/target?value='+encodeURIComponent(el('newtarget').value))}
-async function refresh(){try{let s=await(await fetch('/api/status')).json();el('state').textContent=s.state;el('count').textContent=s.count.toLocaleString();
-el('target').textContent=s.target.toLocaleString();el('reason').textContent=s.reason+(s.reset_message?' | '+s.reset_message:'');
-el('details').textContent=`${s.device} | sensor ${s.sensor?'ON':'off'} | stop ${s.stop_button?'PRESSED':'released'} | FRAM ${s.fram?'OK':'MISSING'} | max scan gap ${s.max_scan_gap_ms}ms | wiring ${s.wiring_verified?'enabled':'BENCH LOCK'}`;}catch(e){el('state').textContent='Connection lost'}}
+const el=id=>document.getElementById(id);let nodes=[],selected=null,host=null,fetching=false,stale=true;
+const selectedNode=()=>nodes.find(n=>n.node===selected);
+function render(){const s=selectedNode();if(!s)return;
+el('tabs').replaceChildren();for(const n of nodes){let b=document.createElement('button');b.textContent=n.node===0?'Local (standalone)':`Node ${n.node}${n.node===host?' (local)':''}${n.online?'':' — OFFLINE'}`;
+b.setAttribute('role','tab');b.setAttribute('aria-selected',String(n.node===selected));b.onclick=()=>{selected=n.node;el('newtarget').value='';el('notice').textContent='';render()};el('tabs').append(b)}
+const online=s.online&&!stale;el('identity').textContent=`Node ${s.node} · ${s.device}`;
+el('state').textContent=online?s.state:'OFFLINE — last known state: '+s.state;
+el('count').textContent=s.count.toLocaleString();el('target').textContent=s.target.toLocaleString();
+el('reason').textContent=s.reason+(s.reset_message?' | '+s.reset_message:'');
+const transport=['','Command queued','Command accepted by node; check state/result','Command rejected / expired','No acknowledgement; outcome unknown. Check node before retrying.'];
+el('freshness').textContent=(online?'Updated':'STALE')+` · sample age ${Math.round(s.age_ms/1000)}s`+(transport[s.command_status]?' · '+transport[s.command_status]:'');
+el('settings').textContent=`Presets A/B/C: ${s.presets.join(' / ')} · No-pulse timeout: ${s.no_pulse_seconds}s · Arm timeout: ${s.arm_timeout_seconds}s`;
+el('details').replaceChildren();const details=[['Optical input',s.sensor?'ACTIVE':'inactive'],['E-stop',s.stop_button?'PRESSED':'released'],['Input hardware',s.inputs_healthy?'OK':'FAULT'],['FRAM',s.fram?'OK':'FAULT'],['Wiring check',s.wiring_verified?'Enabled':'BENCH LOCK'],['Maximum scan gap',s.max_scan_gap_ms+' ms']];
+['Treadmill permit','Green','Red','Buzzer'].forEach((name,i)=>details.push([`Relay ${i+1}: ${name}`,s.relays&(1<<i)?'ON':'OFF']));
+for(const [k,v] of details){let dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=k;dd.textContent=v;el('details').append(dt,dd)}
+document.querySelectorAll('[data-control]').forEach(b=>b.disabled=!online);
+el('saveTarget').disabled=!online||s.completed||['RUNNING','ARMED'].includes(s.state);
+}
+async function cmd(action,value){const id=selected,s=selectedNode();if(!s||!s.online||stale)return;
+try{const r=await fetch(`/api/${action}?node=${id}`+(value===undefined?'':'&value='+encodeURIComponent(value)),{method:'POST',headers:{'X-Flux-Control':'1'}});
+const message=await r.text();if(id===selected)el('notice').textContent=`Node ${id}: ${message}`;await refresh();}catch(e){el('notice').textContent=`Node ${id}: connection lost; command outcome unknown.`}}
+function resetNode(){if(confirm(`Reset Node ${selected}'s step count? The treadmill must be stopped.`))cmd('reset')}
+function setTarget(e){e.preventDefault();cmd('target',el('newtarget').value)}
+async function refresh(){if(fetching)return;fetching=true;try{const r=await fetch('/api/nodes',{signal:AbortSignal.timeout(4000)});if(!r.ok)throw Error(r.status);
+const data=await r.json();nodes=data.nodes;host=data.local_node;if(!nodes.some(n=>n.node===selected))selected=host;stale=false;
+el('bus').textContent=data.bus_enabled?`${data.primary?'Primary':data.candidate?'Electing primary':'Secondary'} · address ${host} · RS-485 ${data.bus_ready?'enabled, 19200 baud':'unavailable'}${data.primary?' · discovering addresses 1–8':' · primary '+(data.leader||'pending')}`:'Standalone · RS-485 disabled — use RS-485 role and address below to configure';
+render();}catch(e){stale=true;el('bus').textContent='Web connection lost — controls disabled';render()}finally{fetching=false}}
 setInterval(refresh,1000);refresh();
 </script></body></html>
 )HTML";
@@ -703,7 +1139,7 @@ a{color:#7fd3ff}
 <div class="card"><form method="post" action="/api/wifi">
 <label>Network name SSID<input name="ssid" maxlength="32" required autocomplete="off"></label>
 <label>Password<input name="password" type="password" maxlength="63" autocomplete="new-password"></label>
-<p class="hint">Use a blank password only for an open network. After saving, the controller restarts and joins this network. Its new address appears on the display.</p>
+<p class="hint">Use a blank password only for an open network. After saving, Wi-Fi reconnects to this network without resetting the count. Its new address appears on the display.</p>
 <button type="submit">Save and connect</button></form></div>
 <div class="card"><form method="post" action="/api/wifi/clear" onsubmit="return confirm('Forget the saved Wi-Fi network?')">
 <button class="danger" type="submit">Forget network and use access point</button></form></div>
@@ -759,7 +1195,31 @@ void queueRequest(CommandKind kind, uint32_t value) {
   if (server.header("X-Flux-Control") != "1") {
     server.send(403, "text/plain", "Control header required"); return;
   }
-  Command c{kind, value};
+  uint8_t node = NODE_ID;
+  if (server.hasArg("node")) {
+    String id=server.arg("node");
+    if(id.length()!=1 || id[0]<'0' || id[0]>'8') {
+      server.send(400,"text/plain","Invalid node address"); return;
+    }
+    node=id[0]-'0';
+  }
+  Command c{kind, value, millis()+1000};
+  if(node != NODE_ID) {
+    xSemaphoreTake(snapshotMutex,portMAX_DELAY);
+    bool primary=sharedPrimary; uint32_t epoch=sharedBusEpoch;
+    bool online=primary && node>=1 && sharedBusReady && peers[node].seen && millis()-peers[node].lastSeen<BUS_OFFLINE_MS;
+    bool busy=peers[node].commandStatus==1;
+    if(online && !busy) peers[node].commandStatus=1;
+    xSemaphoreGive(snapshotMutex);
+    if(!online) { server.send(503,"text/plain","Node offline; command not sent"); return; }
+    if(busy) { server.send(409,"text/plain","A command is already pending for this node"); return; }
+    BusCommand bc{node,c,millis(),epoch};
+    if(xQueueSend(busCommandQueue,&bc,0)!=pdTRUE) {
+      xSemaphoreTake(snapshotMutex,portMAX_DELAY); peers[node].commandStatus=3; xSemaphoreGive(snapshotMutex);
+      server.send(503,"text/plain","Bus queue full; command not sent"); return;
+    }
+    server.send(202,"text/plain","Queued for node; check status and result"); return;
+  }
   if (xQueueSend(commandQueue, &c, 0) != pdTRUE) {
     server.send(503, "text/plain", "Busy; retry"); return;
   }
@@ -770,6 +1230,15 @@ void serviceCommands() {
   Command c;
   // Bound work per scan; remote ARM is deliberately not enabled.
   if (xQueueReceive(commandQueue, &c, 0) != pdTRUE) return;
+  if (c.deadline && int32_t(millis()-c.deadline)>=0) {
+    if(c.kind==CommandKind::BUS_CONFIG) { uint8_t result=5; xQueueSend(busConfigReplyQueue,&result,0); }
+    reportReset("Command expired; retry",true); return;
+  }
+  if(c.kind==CommandKind::BUS_CONFIG) {
+    uint8_t result=applyBusSettings(c.value);
+    xQueueSend(busConfigReplyQueue,&result,0); return;
+  }
+  if(busConfigRestartPending) return;
   switch (c.kind) {
     case CommandKind::STOP:
       requestTreadmillStop(StopReason::WEB, RunState::STOPPED); break;
@@ -782,11 +1251,13 @@ void serviceCommands() {
       break;
     case CommandKind::RESET: resetCount(); break;
     case CommandKind::TARGET:
-      if (!completionLatched && runState != RunState::RUNNING && runState != RunState::ARMED) {
+      if (c.value > 0 && c.value <= MAX_TARGET && framAvailable && !completionLatched &&
+          runState != RunState::RUNNING && runState != RunState::ARMED) {
         stepTarget = c.value; writeFramRecord();
-      }
+        reportReset(framAvailable ? "Target saved" : "Target save failed", !framAvailable);
+      } else reportReset("Target change blocked",true);
       break;
-    case CommandKind::ARM: break;
+    case CommandKind::ARM: case CommandKind::BUS_CONFIG: break;
   }
 }
 
@@ -794,6 +1265,34 @@ void setupWebServer() {
   const char *headers[] = {"X-Flux-Control"};
   server.collectHeaders(headers, 1);
   server.on("/", HTTP_GET, []() { if (authenticated()) server.send_P(200, "text/html", PAGE); });
+  server.on("/bus", HTTP_GET, []() { if(authenticated())server.send_P(200,"text/html",BUS_PAGE); });
+  server.on("/api/bus", HTTP_GET, []() {
+    if(!authenticated())return;
+    server.sendHeader("Cache-Control","no-store");
+    server.send(200,"application/json","{\"device\":"+jsonQuoted(deviceName)+",\"role\":"+
+      String(!RS485_ENABLED?0:PREFERRED_PRIMARY?1:2)+",\"node\":"+String(NODE_ID)+"}");
+  });
+  server.on("/api/bus", HTTP_POST, []() {
+    if(!authenticated())return;
+    if(server.header("X-Flux-Control")!="1") { server.send(403,"text/plain","Control header required"); return; }
+    String role=server.arg("role"),node=server.arg("node");
+    if(role.length()!=1 || role[0]<'0' || role[0]>'2' || node.length()!=1 || node[0]<'0' || node[0]>'8') {
+      server.send(400,"text/plain","Invalid role or address"); return;
+    }
+    uint32_t packed=(uint32_t(role[0]-'0')<<8)|(node[0]-'0');
+    if(!validBusConfig(packed)) { server.send(400,"text/plain","Primary: 1; secondary: 2-8; standalone: 0"); return; }
+    uint8_t result;
+    while(xQueueReceive(busConfigReplyQueue,&result,0)==pdTRUE) {}
+    Command c{CommandKind::BUS_CONFIG,packed,millis()+750};
+    if(xQueueSend(commandQueue,&c,0)!=pdTRUE) { server.send(503,"text/plain","Busy; retry"); return; }
+    if(xQueueReceive(busConfigReplyQueue,&result,pdMS_TO_TICKS(1000))!=pdTRUE) {
+      server.send(504,"text/plain","No confirmation. Check this unit's settings after any restart before retrying."); return;
+    }
+    const char *messages[]={"Saved. Restarting this unit; count retained. Returning to dashboard...",
+      "Stop this treadmill and wait at least 3 seconds after the last sensor transition.",
+      "Invalid role/address.","Could not save settings.","Restart already pending.","Request expired; retry."};
+    server.send(result==0?200:409,"text/plain",messages[result<=5?result:3]);
+  });
   server.on("/wifi", HTTP_GET, []() {
     if (authenticated()) server.send_P(200, "text/html", WIFI_PAGE);
   });
@@ -813,7 +1312,7 @@ void setupWebServer() {
     if (!saveWifiSettings(ssid, password)) {
       server.send(500, "text/plain", "Could not save Wi-Fi settings"); return;
     }
-    server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width'><h2>Wi-Fi saved</h2><p>The controller is restarting. Its new address will appear on the display.</p>");
+    server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width'><h2>Wi-Fi saved</h2><p>Wi-Fi is reconnecting. Its new address will appear on the display.</p>");
     scheduleNetworkRestart();
   });
   server.on("/api/wifi/clear", HTTP_POST, []() {
@@ -821,10 +1320,11 @@ void setupWebServer() {
     if (!saveWifiSettings("", "")) {
       server.send(500, "text/plain", "Could not clear Wi-Fi settings"); return;
     }
-    server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width'><h2>Wi-Fi cleared</h2><p>The controller is restarting in access-point mode.</p>");
+    server.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width'><h2>Wi-Fi cleared</h2><p>Wi-Fi is switching to access-point mode.</p>");
     scheduleNetworkRestart();
   });
   server.on("/api/status", HTTP_GET, sendStatus);
+  server.on("/api/nodes", HTTP_GET, sendNodes);
   server.on("/api/pause", HTTP_POST, []() { queueRequest(CommandKind::PAUSE); });
   server.on("/api/stop", HTTP_POST, []() {
     queueRequest(CommandKind::STOP);
@@ -855,41 +1355,50 @@ void startFallbackAp() {
   Serial.printf("Fallback AP: %s  http://%s\n", deviceName.c_str(), WiFi.softAPIP().toString().c_str());
 }
 
+// This task alone owns the radio and HTTP server. Never block waiting for Wi-Fi:
+// a primary demotion must turn the radio off promptly even during association.
+uint32_t wifiConnectStarted=0;
 void setupWifi() {
   loadWifiSettings();
   WiFi.setHostname(deviceName.c_str());
-
-  if (configuredWifiSsid.length() == 0) {
-    startFallbackAp();
-    return;
-  }
-
+  fallbackApStarted=false;
+  wifiConnectStarted=lastWifiAttemptAt=millis();
+  if(configuredWifiSsid.length()==0) { startFallbackAp();return; }
   WiFi.mode(WIFI_STA);
-  WiFi.begin(configuredWifiSsid.c_str(), configuredWifiPassword.c_str());
-  const uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - started < WIFI_CONNECT_MS) delay(100);
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Wi-Fi: http://%s  (%s)\n", deviceName.c_str(), WiFi.localIP().toString().c_str());
-  } else {
-    startFallbackAp();
-  }
+  WiFi.begin(configuredWifiSsid.c_str(),configuredWifiPassword.c_str());
 }
-
 void networkTask(void *) {
-  setupWifi();
-  setupWebServer();
-  for (;;) {
-    serviceWifi();
-    server.handleClient();
-    if (networkRestartRequested && static_cast<int32_t>(millis() - networkRestartAt) >= 0) {
-      delay(50);
-      ESP.restart();
-    }
-    String ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
-    xSemaphoreTake(snapshotMutex, portMAX_DELAY);
-    sharedAddress = ip;
+  bool radioOn=false,routesInstalled=false;
+  WiFi.mode(WIFI_OFF);
+  for(;;) {
+    xSemaphoreTake(snapshotMutex,portMAX_DELAY);
+    const bool primary=sharedPrimary;const uint8_t leader=sharedLeader;
     xSemaphoreGive(snapshotMutex);
-    vTaskDelay(pdMS_TO_TICKS(2));
+    const bool wanted=!RS485_ENABLED || primary;
+    if(!wanted && radioOn) {
+      server.stop();WiFi.softAPdisconnect(true);WiFi.disconnect(true);WiFi.mode(WIFI_OFF);
+      fallbackApStarted=false;radioOn=false;networkRestartRequested=false;
+    }
+    if(wanted && !radioOn) {
+      setupWifi();
+      if(!routesInstalled) { setupWebServer();routesInstalled=true; } else server.begin();
+      radioOn=true;
+    }
+    if(radioOn) {
+      serviceWifi();server.handleClient();
+      if(networkRestartRequested && int32_t(millis()-networkRestartAt)>=0) {
+        networkRestartRequested=false;
+        WiFi.softAPdisconnect(true);WiFi.disconnect(true);WiFi.mode(WIFI_OFF);
+        setupWifi();
+      }
+    }
+    String address;
+    if(!radioOn)address="Secondary N"+String(NODE_ID)+" / P"+String(leader);
+    else if(WiFi.status()==WL_CONNECTED)address=WiFi.localIP().toString();
+    else if(fallbackApStarted)address=WiFi.softAPIP().toString();
+    else address="Wi-Fi connecting";
+    xSemaphoreTake(snapshotMutex,portMAX_DELAY);sharedAddress=address;xSemaphoreGive(snapshotMutex);
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
@@ -898,18 +1407,22 @@ void publishStatus() {
   if (millis() - last < 200) return;
   last = millis();
   String s = jsonStatus();
+  uint16_t regs[BUS_REG_COUNT]; buildBusSnapshot(regs);
   xSemaphoreTake(snapshotMutex, portMAX_DELAY);
   sharedStatus = s;
+  memcpy(localRegs,regs,sizeof(regs));
+  displayPrimary=sharedPrimary;displayCandidate=sharedCandidate;
+  displayBusReady=sharedBusReady;
+  displayBusOnline=sharedBusSeen && millis()-sharedBusLast<BUS_OFFLINE_MS;
   networkAddress = sharedAddress;
   xSemaphoreGive(snapshotMutex);
 }
 
 void serviceWifi() {
-  if (WiFi.status() == WL_CONNECTED || configuredWifiSsid.length() == 0) return;
-  if (millis() - lastWifiAttemptAt >= 30000) {
-    lastWifiAttemptAt = millis();
-    WiFi.reconnect();
-    if (!fallbackApStarted) startFallbackAp();
+  if(WiFi.status()==WL_CONNECTED || configuredWifiSsid.length()==0)return;
+  if(!fallbackApStarted && millis()-wifiConnectStarted>=WIFI_CONNECT_MS)startFallbackAp();
+  if(millis()-lastWifiAttemptAt>=30000) {
+    lastWifiAttemptAt=millis();WiFi.reconnect();
   }
 }
 
@@ -936,9 +1449,10 @@ void drawDisplay() {
         !inputsHealthy ? TFT_RED : (sensorStable || pulseFlash) ? TFT_CYAN : dim);
   badge(third + 2, third - 4, !inputsHealthy ? "EST ERR" : stopAuxStable ? "EST STOP" : "EST OK",
         !inputsHealthy || stopAuxStable ? TFT_RED : TFT_GREEN);
-  // No Modbus service in this standalone firmware. UART activity alone is
-  // not proof of a healthy link; future OK must require valid peer replies.
-  badge(2 * third + 2, w - 2 * third - 4, "485 OFF", dim);
+  badge(2 * third + 2, w - 2 * third - 4,
+        !RS485_ENABLED ? "485 OFF" : !displayBusReady ? "485 ERR" : displayCandidate ? "ELECT" :
+        displayBusOnline ? (displayPrimary ? "P485 OK" : "S485 OK") : (displayPrimary ? "P485 WAIT" : "S485 WAIT"),
+        !RS485_ENABLED ? dim : !displayBusReady ? TFT_RED : displayBusOnline ? TFT_GREEN : dim);
 
   auto centered = [&](const String &text, int y, uint16_t color, int size) {
     d.setTextSize(size);
@@ -1002,6 +1516,10 @@ void handleLocalButtons() {
 
 void setup() {
   Serial.begin(115200);
+  loadBusSettings();
+  auto plcConfig = M5StamPLC.config();
+  plcConfig.enableModbusSlave = false; // this sketch owns UART1
+  M5StamPLC.config(plcConfig);
   M5StamPLC.begin();
   M5StamPLC.setBacklight(true);
   // Perimeter layout is designed for the 240 x 135 landscape screen.
@@ -1024,8 +1542,13 @@ void setup() {
   lastObservedEdge = millis(); // require initial settling before first local Arm
   commandQueue = xQueueCreate(8, sizeof(Command));
   snapshotMutex = xSemaphoreCreateMutex();
-  if (!commandQueue || !snapshotMutex) { while (true) delay(1000); }
+  busCommandQueue = xQueueCreate(8,sizeof(BusCommand));
+  busConfigReplyQueue = xQueueCreate(1,sizeof(uint8_t));
+  if (!commandQueue || !snapshotMutex || !busCommandQueue || !busConfigReplyQueue) { while (true) delay(1000); }
   sharedStatus = jsonStatus();
+  buildBusSnapshot(localRegs);
+  if (RS485_ENABLED && xTaskCreatePinnedToCore(busTask, "flux-rs485", 6144, nullptr, 2, nullptr, 0) != pdPASS)
+    Serial.println("RS485 task failed; local controls remain available");
   if (xTaskCreatePinnedToCore(networkTask, "flux-web", 8192, nullptr, 1, nullptr, 0) != pdPASS)
     Serial.println("Network task failed; local controls remain available");
   updateIndicators();
@@ -1050,5 +1573,9 @@ void loop() {
   if (runState != indicated) { indicated = runState; updateIndicators(); }
   publishStatus();
   drawDisplay();
+  if(busConfigRestartPending && int32_t(millis()-busConfigRestartAt)>=0) {
+    setTreadmillStopped(true);
+    ESP.restart();
+  }
   delay(1);
 }
